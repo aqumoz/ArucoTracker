@@ -369,8 +369,11 @@ int main(int argc, char** argv) {
         analyses.push_back({video, line});
     }
 
+    int video_count = 0;
+    std::cout << "Analysing videos" << std::endl;
     for (const auto& analysis : analyses) {
         analyze_video(analysis, overlay);
+        std::cout << "Video: " << ++video_count << std::endl;
     }
 
     return 0;
