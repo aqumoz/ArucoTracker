@@ -10,13 +10,22 @@
 
 namespace fs = std::filesystem;
 
+bool measure = false;
+bool overlay = false;
+double px_to_mm = 1.0;
+
 struct Line {
     cv::Point2f p1, p2;
+    bool operator==(const Line& other) const {
+        return p1 == other.p1 && p2 == other.p2;
+    }
 };
 
 struct VideoAnalysis {
     std::string video_path;
     Line line;
+    cv::Point2f start;
+    float total_dist;
 };
 
 std::vector<std::string> get_video_files(const std::string& folder) {
@@ -69,12 +78,19 @@ Line extend_line_to_frame(const Line& line, const cv::Size& frame_size) {
     return ll;
 }
 
+float dist(const cv::Point2f& p1, const cv::Point2f& p2){
+    float dx = p1.x - p2.x;
+    float dy = p1.y - p2.y;
+    return std::sqrt(dx*dx + dy*dy);
+}
+
 static bool click1 = true; // is first click
 void draw_line_callback(int event, int x, int y, int, void* userdata) {
     if (event != cv::EVENT_LBUTTONDOWN)
         return;
 
-    auto* line = reinterpret_cast<Line*>(userdata);
+    Line* line = reinterpret_cast<Line*>(userdata);
+    // line[1] = line[0]; // previous line = line;
     if(click1)
         line->p1 = cv::Point2f(x, y);
     else
@@ -96,41 +112,49 @@ Line get_line_from_user(const std::string& video_path) {
     }
 
     Line line;
+    Line prev_line;
     cv::namedWindow("Draw Line");
     cv::setMouseCallback("Draw Line", draw_line_callback, &line);
 
     std::cout << "Draw a line by clicking two points on the first frame of: " << video_path << std::endl;
-    cv::Mat temp = frame.clone();
-    cv::imshow("Draw Line", temp);
-    do {
-        // std::cout << "test " << line.p1.x << ' ' << line.p1.y << std::endl;
-        if (line.p1 != cv::Point2f()){
-            cv::circle(temp, line.p1, 5, cv::Scalar(0,255,0), -1);
+    cv::Mat temp;
+    cv::imshow("Draw Line", frame);
+    int key;
+    bool first_point = true; // Is used to track, if it is the first point or second point getting placed.
+
+    while (cv::waitKey(30) != '-'){// Hyphen to continue
+
+        if(line == prev_line)
+            continue;
+        else
+            prev_line = line;
+
+        if (first_point){
+            temp = frame.clone();
+            cv::circle(temp, line.p1, 5, cv::Scalar(0, 255, 0), -1);
             cv::imshow("Draw Line", temp);
+            first_point = false;
         }
-        if (cv::waitKey(30) == 27) break; // ESC to exit
-
-    } while (line.p1 == cv::Point2f() || line.p2 == cv::Point2f());
-
-    cv::circle(temp, line.p2, 5, cv::Scalar(0,255,0), -1);
-
-    Line extended_line = extend_line_to_frame(line, cv::Size(frame.cols, frame.rows));
-    cv::line(temp, extended_line.p1, extended_line.p2, cv::Scalar(255,0,0), 2);
-
-    // cv::line(temp, line.p1, line.p2, cv::Scalar(0,0,255), 2);
-
-    cv::imshow("Draw Line", temp);
-
-    while(1){
-        int key = cv::waitKey(30);
-        if(key == '-')
-            break;
+        else {
+            if(measure){
+                cv::line(temp, line.p1, line.p2, cv::Scalar(255,0,0), 2);
+                std::cout << "Distance [px]: " << dist(line.p1, line.p2) << std::endl;
+            }
+            else{
+                Line extended_line = extend_line_to_frame(line, cv::Size(frame.cols, frame.rows));
+                cv::line(temp, extended_line.p1, extended_line.p2, cv::Scalar(255,0,0), 2);
+            }
+            cv::circle(temp, line.p1, 5, cv::Scalar(0, 255, 0), -1);
+            cv::circle(temp, line.p2, 5, cv::Scalar(0,0,255), -1);
+            cv::imshow("Draw Line", temp);
+            first_point = true;
+        }
     }
-    
 
     cv::destroyWindow("Draw Line");
     return line;
 }
+
 
 float point_line_distance(const cv::Point2f& pt, const Line& line) {
     cv::Point2f v = line.p2 - line.p1;
@@ -141,6 +165,28 @@ float point_line_distance(const cv::Point2f& pt, const Line& line) {
     cv::Point2f pb = line.p1 + b * v;
     return cv::norm(pt - pb);
 }
+
+
+cv::Point2f project_marker_onto_line(const cv::Point2f& pt, const Line& line){
+    cv::Point2f pt_ = pt - line.p1;
+    cv::Point2f p2 = line.p2 - line.p1;
+
+    return (pt_.dot(p2) / p2.dot(p2)) * p2 + line.p1;
+}
+
+
+float dist_from_start(uint frame_num, const cv::Point2f& pt, VideoAnalysis& analysis) {
+    const cv::Point2f& end = analysis.line.p2;
+    if(frame_num == 0){
+        analysis.start = project_marker_onto_line(pt, analysis.line);
+        analysis.total_dist = dist(analysis.start, end);
+    }
+
+    const cv::Point2f marker_ = project_marker_onto_line(pt, analysis.line);
+
+    return dist(analysis.start, marker_);
+}
+
 
 cv::Point2f track_aruco(const cv::Mat& frame) {
     std::vector<std::vector<cv::Point2f>> markerCorners;
@@ -206,7 +252,15 @@ void applyGamma(cv::Mat& img, double gamma)
     cv::LUT(img, lut, img);
 }
 
-void analyze_video(const VideoAnalysis& analysis, bool overlay = false) {
+
+/**
+ * Analyzes the video.
+ *
+ * @param analysis   The analysis settings.
+ * @param overlay    Whether to draw the overlay on the frames.
+ * @param px_to_mm   Conversion factor from pixels to millimeters. (default is 1 (no conversion))
+ */
+void analyze_video(VideoAnalysis& analysis) {
     cv::VideoCapture cap(analysis.video_path);
     if (!cap.isOpened()) {
         std::cerr << "Failed to open video: " << analysis.video_path << std::endl;
@@ -225,15 +279,15 @@ void analyze_video(const VideoAnalysis& analysis, bool overlay = false) {
 
     std::string csv_path = outPath + "/analysis.csv";
     std::ofstream csv(csv_path);
-    csv << "\"frame\",\"x\",\"y\",\"distance_to_line\"\n";
+    csv << "\"frame\",\"x\",\"y\",\"distance_to_line_px\",\"distance_to_line_mm\",\"distance_from_start_in_px\",\"distance_from_start_in_mm\",\"time_in_seconds\"\n";
 
     // Setup output video if overlay is enabled
     cv::VideoWriter video_out;
+    double fps = cap.get(cv::CAP_PROP_FPS);
     if (overlay) {
         int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
         cv::Size frame_size(cap.get(cv::CAP_PROP_FRAME_WIDTH), 
                            cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-        double fps = cap.get(cv::CAP_PROP_FPS);
         std::string overlay_path = outPath + "/overlay.mp4";
         video_out.open(overlay_path, fourcc, fps, frame_size, true);
         
@@ -247,6 +301,7 @@ void analyze_video(const VideoAnalysis& analysis, bool overlay = false) {
     cv::Mat tmp;
     cv::Mat frame;
     float gamma = 2.0;
+
     while (cap.read(frame)) {
         // cv::Point2f obj_pos = track_red_object(frame);
         // cv::cvtColor(tmp, frame, cv::COLOR_BGR2GRAY, 1);
@@ -255,8 +310,19 @@ void analyze_video(const VideoAnalysis& analysis, bool overlay = false) {
 
         cv::Point2f obj_pos = track_aruco(frame);
         float dist = -1;
+        float dist_from_start_px = -1.0;
+        float dist_from_start_mm = -1.0;
         if (obj_pos.x >= 0 && obj_pos.y >= 0)
             dist = point_line_distance(obj_pos, analysis.line);
+
+            // The distance from the start to end, projected along the line.
+            dist_from_start_px = dist_from_start(frame_num, obj_pos, analysis);
+
+            // If the marker have moved beyond the end point, then stop.
+            if(dist_from_start_px > analysis.total_dist)
+                break;
+
+            dist_from_start_mm = dist_from_start_px * px_to_mm;
         
         if (overlay) {
             // Calculate extended line points
@@ -266,27 +332,37 @@ void analyze_video(const VideoAnalysis& analysis, bool overlay = false) {
             // Draw extended line in magenta
             cv::line(frame, extended.p1, extended.p2, cv::Scalar(255, 0, 255), 2);
             
-            // Draw green circles at original line endpoints
-            cv::circle(frame, analysis.line.p1, 5, cv::Scalar(0, 255, 0), -1);
-            cv::circle(frame, analysis.line.p2, 5, cv::Scalar(0, 255, 0), -1);
-            
-            // Draw cross at tracked object position if found
             if (obj_pos.x >= 0 && obj_pos.y >= 0) {
                 int cross_size = 10;
+                // Draw cross at tracked object position if found
                 cv::line(frame, 
                         cv::Point(obj_pos.x - cross_size, obj_pos.y - cross_size),
                         cv::Point(obj_pos.x + cross_size, obj_pos.y + cross_size),
                         cv::Scalar(0, 0, 255), 2);
+
                 cv::line(frame,
                         cv::Point(obj_pos.x - cross_size, obj_pos.y + cross_size),
                         cv::Point(obj_pos.x + cross_size, obj_pos.y - cross_size),
                         cv::Scalar(0, 0, 255), 2);
+
+                // Draw line from marker to line.
+                cv::line(frame,
+                        cv::Point(obj_pos.x, obj_pos.y),
+                        project_marker_onto_line(obj_pos, analysis.line),
+                        cv::Scalar(0, 255, 0), 2);
             }
+
+            // Draw circles at original line endpoints
+            cv::circle(frame, analysis.line.p1, 5, cv::Scalar(127, 127, 0), -1);
+            cv::circle(frame, analysis.line.p2, 5, cv::Scalar(0, 255, 0), -1);
+
+            // Draw start point
+            cv::circle(frame, analysis.start, 5, cv::Scalar(0, 255, 255), -1);
             
             video_out.write(frame);
         }
-        
-        csv << frame_num << "," << obj_pos.x << "," << obj_pos.y << "," << dist << "\n";
+        float time_in_seconds = frame_num/fps;
+        csv << frame_num << "," << obj_pos.x << "," << obj_pos.y << "," << dist << "," << dist * px_to_mm << "," << dist_from_start_px << "," << dist_from_start_mm << "," << time_in_seconds << std::endl;
         frame_num++;
     }
     
@@ -316,22 +392,30 @@ void generate_aruco(int num_markers, std::string output_path){
 int main(int argc, char** argv) {
     argparse::ArgumentParser program("video_analyzer");
     
-    program.add_description("Analyze movement in videos relative to a reference line");
+    program.add_description("Analyze movement of an aruco marker in videos\nrelative to a reference line and a start and end point.");
     
     // Add arguments
     program.add_argument("input")
-        .help("Folder containing video files to analyze")
+        .help("Folder containing video files to analyze.")
         .nargs(0, 1);
+    
+    program.add_argument("-c", "--px-mm")
+        .help("The number used to convert from pixels to millimeters.")
+        .store_into(px_to_mm);
 
-    program.add_argument("--gen-aruco")
-        .help("Generate ArUco markers: --gen-aruco <number> <output_path>")
+    program.add_argument("-g", "--gen-aruco")
+        .help("Generate ArUco markers: --gen-aruco <number> <output_path>.")
         .nargs(2)
         .default_value(std::vector<std::string>());
+
+    program.add_argument("-m", "--measure-px")
+        .help("Shows the first frame and prints the distance between two points you click on.")
+        .store_into(measure)
+        .flag();
         
-    program.add_argument("--overlay")
-        .help("Create video with analysis visualization overlay")
-        .default_value(false)
-        .implicit_value(true);
+    program.add_argument("-ol", "--overlay")
+        .help("Create video with analysis visualization overlay.")
+        .store_into(overlay);
         
     // Parse arguments
     try {
@@ -355,8 +439,7 @@ int main(int argc, char** argv) {
     }
 
     std::string folder = program.get<std::string>("input");
-    bool overlay = program.get<bool>("--overlay");
-    
+
     std::vector<std::string> videos = get_video_files(folder);
     if (videos.empty()) {
         std::cout << "No video files found in folder: " << folder << std::endl;
@@ -369,10 +452,13 @@ int main(int argc, char** argv) {
         analyses.push_back({video, line});
     }
 
+    if(measure)
+        return 0;
+
     int video_count = 0;
     std::cout << "Analysing videos" << std::endl;
-    for (const auto& analysis : analyses) {
-        analyze_video(analysis, overlay);
+    for (auto& analysis : analyses) {
+        analyze_video(analysis);
         std::cout << "Video: " << ++video_count << std::endl;
     }
 
