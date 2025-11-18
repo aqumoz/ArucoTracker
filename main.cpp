@@ -157,13 +157,17 @@ Line get_line_from_user(const std::string& video_path) {
 
 
 float point_line_distance(const cv::Point2f& pt, const Line& line) {
-    cv::Point2f v = line.p2 - line.p1;
-    cv::Point2f w = pt - line.p1;
-    float c1 = v.dot(w);
-    float c2 = v.dot(v);
-    float b = c1 / c2;
-    cv::Point2f pb = line.p1 + b * v;
-    return cv::norm(pt - pb);
+    cv::Point2f b = line.p2 - line.p1;
+    cv::Point2f a = pt - line.p1;
+    float c1 = b.dot(a);
+    float c2 = b.dot(b);
+    float h = c1 / c2;
+    cv::Point2f a2 = (a - h * b);
+    // return -cv::norm(a2);
+    if(cv::Point3f(b).cross(cv::Point3f(a2)).z >= 0.0)
+        return cv::norm(a2);
+    else
+        return -cv::norm(a2);
 }
 
 
